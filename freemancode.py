@@ -88,7 +88,7 @@ def process_characters(characters):
 
 def main():
     """Main function to process the .pot file and print results."""
-    file_path = Path("C001-f.pot")
+    file_path = Path("/Users/macbookpro/Desktop/Thesis/C001-f.pot")
     if not file_path.exists():
         print(f"Error: File {file_path} not found.")
         return
