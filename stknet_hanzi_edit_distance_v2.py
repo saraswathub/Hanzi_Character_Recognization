@@ -120,10 +120,17 @@ def resample_xy(traj: np.ndarray, target_len: int) -> np.ndarray:
     return np.column_stack((x_new, y_new)).astype(np.float32)
 
 # ===== NEW: Edit Distance Functions =====
-def compute_freeman_edit_distance(codes1: List[str], codes2: List[str]) -> float:
+def compute_freeman_edit_distance(codes1: List[str], codes2: List[str], normalize: bool = True) -> float:
     """
     Compute normalized edit distance between two Freeman code sequences.
-    Returns value between 0 (identical) and 1 (completely different).
+    
+    Args:
+        codes1: First sequence of Freeman codes
+        codes2: Second sequence of Freeman codes
+        normalize: If True, normalize the distance by the length of the longer sequence
+        
+    Returns:
+        float: Normalized edit distance between 0 (identical) and 1 (completely different)
     """
     if not codes1 and not codes2:
         return 0.0
@@ -134,13 +141,24 @@ def compute_freeman_edit_distance(codes1: List[str], codes2: List[str]) -> float
     str1 = ''.join(codes1)
     str2 = ''.join(codes2)
     
-    # Use SequenceMatcher to compute similarity ratio
-    similarity = SequenceMatcher(None, str1, str2).ratio()
+    # Use SequenceMatcher to compute edit operations
+    matcher = SequenceMatcher(None, str1, str2)
     
-    # Convert similarity [0,1] to distance [1,0], then normalize to [0,1]
-    distance = 1.0 - similarity
+    if not normalize:
+        # Raw edit distance (number of operations)
+        return 1.0 - matcher.ratio()
     
-    return distance
+    # Normalized edit distance
+    max_len = max(len(str1), len(str2))
+    if max_len == 0:
+        return 0.0
+        
+    # Calculate operations and normalize
+    ops = matcher.get_opcodes()
+    edit_distance = sum(max(i2-i1, j2-j1) for op, i1, i2, j1, j2 in ops 
+                       if op != 'equal')
+    
+    return min(1.0, edit_distance / max_len)
 
 def compute_stroke_level_edit_distance(strokes1: List[str], strokes2: List[str]) -> float:
     """
@@ -536,19 +554,147 @@ def knn_vote(pred_matrix: np.ndarray, train_labels: np.ndarray, k: int):
         return np.apply_along_axis(lambda x: np.bincount(x).argmax(), axis=1, arr=arr)
     return row_mode(votes)
 
-def model_predict_hanzi_edit_distance(test_samples, test_freeman_codes, ref_samples, ref_freeman_codes, ref_labels, model, k=None):
+def compute_character_level_accuracy(predicted_chars, true_chars):
     """
-    Modified prediction function that uses edit distance for additional validation.
+    Compute character-level accuracy by comparing reconstructed Freeman codes.
+    
+    Args:
+        predicted_chars: List of predicted Freeman code sequences (one per character)
+        true_chars: List of ground-truth Freeman code sequences (one per character)
+        
+    Returns:
+        float: Accuracy between 0 and 1
     """
+    correct = 0
+    total = len(predicted_chars)
+    
+    for pred, true in zip(predicted_chars, true_chars):
+        # Remove any stroke separators and compare
+        pred_clean = pred.replace('-', '').strip()
+        true_clean = true.replace('-', '').strip()
+        if pred_clean == true_clean:
+            correct += 1
+            
+    return correct / total if total > 0 else 0.0
+
+def reconstruct_character_freeman(stroke_sequences):
+    """
+    Reconstruct character-level Freeman code from stroke sequences.
+    
+    Args:
+        stroke_sequences: List of Freeman code sequences for each stroke
+        
+    Returns:
+        str: Combined Freeman code for the character
+    """
+    # Join strokes with a separator that won't conflict with Freeman codes
+    return '-'.join(''.join(codes) for codes in stroke_sequences)
+
+def model_predict_hanzi_edit_distance(test_samples, test_freeman_codes, ref_samples, ref_freeman_codes, 
+                                    ref_labels, model, k=None, test_char_labels=None, ref_char_labels=None):
+    """
+    Enhanced prediction function with character-level evaluation.
+    
+    Args:
+        test_samples: Test trajectory samples
+        test_freeman_codes: Freeman codes for test samples
+        ref_samples: Reference trajectory samples
+        ref_freeman_codes: Freeman codes for reference samples
+        ref_labels: Labels for reference samples
+        model: Trained STKNet model
+        k: Number of neighbors for kNN
+        test_char_labels: Optional list of character labels for test samples
+        ref_char_labels: Optional list of character labels for reference samples
+        
+    Returns:
+        tuple: (predicted_labels, character_accuracy, char_level_metrics)
+    """
+    if k is None:
+        k = 5
+        
+    # Get pairwise distances using the model
     n_test = len(test_samples)
     n_ref = len(ref_samples)
     
     if n_test == 0 or n_ref == 0:
         print(f"Warning: Skipping prediction (n_test={n_test}, n_ref={n_ref}).")
-        return np.array([], dtype=np.int32), np.zeros((n_test, n_ref), dtype=np.float32)
+        return np.array([], dtype=np.int32), np.zeros((n_test, n_ref), dtype=np.float32), {}
     
-    if k is None:
-        k = max(1, int(math.ceil(math.sqrt(n_ref // max(1, len(np.unique(ref_labels)))))))
+    # Initialize distance matrix
+    dist_matrix = np.zeros((n_test, n_ref))
+    
+    # Compute distances in batches to save memory
+    batch_size = 32
+    for i in tqdm(range(0, n_test, batch_size), desc="Computing distances"):
+        batch_test = np.array(test_samples[i:i+batch_size])
+        batch_dist = []
+        
+        for j in range(0, n_ref, batch_size):
+            batch_ref = np.array(ref_samples[j:j+batch_size])
+            
+            # Create pairs for the current batch
+            x1 = np.repeat(batch_test, len(batch_ref), axis=0)
+            x2 = np.tile(batch_ref, (len(batch_test), 1, 1))
+            
+            # Predict distances
+            batch_pred = model.predict([x1, x2], verbose=0).flatten()
+            batch_dist.append(batch_pred.reshape(len(batch_test), -1))
+            
+        # Stack distances for this test batch
+        dist_matrix[i:i+len(batch_test)] = np.hstack(batch_dist)
+    
+    # Get k nearest neighbors for each test sample
+    knn_indices = np.argpartition(dist_matrix, k, axis=1)[:, :k]
+    
+    # Predict labels using kNN voting
+    predicted_labels = []
+    for i in range(n_test):
+        neighbor_labels = [ref_labels[idx] for idx in knn_indices[i]]
+        predicted_labels.append(Counter(neighbor_labels).most_common(1)[0][0])
+    
+    # Character-level evaluation if character labels are provided
+    char_level_metrics = {}
+    if test_char_labels is not None and ref_char_labels is not None:
+        # Reconstruct character-level Freeman codes
+        test_chars = {}
+        ref_chars = {}
+        
+        # Group strokes by character for test set
+        char_strokes = {}
+        for i, (codes, char_label) in enumerate(zip(test_freeman_codes, test_char_labels)):
+            if char_label not in char_strokes:
+                char_strokes[char_label] = []
+            char_strokes[char_label].append(codes)
+        
+        # Reconstruct characters for test set
+        test_char_codes = {}
+        for char_label, strokes in char_strokes.items():
+            test_char_codes[char_label] = reconstruct_character_freeman(strokes)
+        
+        # Do the same for reference set
+        ref_char_strokes = {}
+        for i, (codes, char_label) in enumerate(zip(ref_freeman_codes, ref_char_labels)):
+            if char_label not in ref_char_strokes:
+                ref_char_strokes[char_label] = []
+            ref_char_strokes[char_label].append(codes)
+        
+        ref_char_codes = {}
+        for char_label, strokes in ref_char_strokes.items():
+            ref_char_codes[char_label] = reconstruct_character_freeman(strokes)
+        
+        # Compute character-level accuracy
+        char_accuracy = compute_character_level_accuracy(
+            list(test_char_codes.values()), 
+            [ref_char_codes.get(lbl, '') for lbl in test_char_codes.keys()]
+        )
+        
+        char_level_metrics = {
+            'character_accuracy': char_accuracy,
+            'num_test_chars': len(test_char_codes),
+            'num_ref_chars': len(ref_char_codes)
+        }
+    
+    return np.array(predicted_labels), dist_matrix, char_level_metrics
     
     # Create pairwise comparison arrays
     X1 = np.repeat(np.array(test_samples), n_ref, axis=0)
@@ -584,9 +730,13 @@ if __name__ == "__main__":
     
     print(f"Train writers: {len(writers) - n_test_writers}, Test writers: {n_test_writers}")
     
-    # Build samples with Freeman codes
+    # Build samples with Freeman codes and track character information
     train_samples_xy, train_labels_text, train_ids, train_freeman_codes = build_samples_from_df(train_df)
     test_samples_xy, test_labels_text, test_ids, test_freeman_codes = build_samples_from_df(test_df)
+    
+    # Extract character labels (assuming format is 'writer|char_nr' in train_ids/test_ids)
+    train_char_labels = [f"{id_.split('|')[0]}_{id_.split('|')[1]}" for id_ in train_ids]
+    test_char_labels = [f"{id_.split('|')[0]}_{id_.split('|')[1]}" for id_ in test_ids]
     
     print(f"Built {len(train_samples_xy)} train samples, {len(test_samples_xy)} test samples.")
     
@@ -738,13 +888,17 @@ if __name__ == "__main__":
         print("Cannot evaluate: empty test or reference set.")
     else:
         # STKNet + KNN evaluation
-        print("Evaluating STKNet + KNN...")
-        predicted_labels_stknet, similarity_matrix = model_predict_hanzi_edit_distance(
-            test_samples_2d, test_freeman_codes, ref_samples_2d, ref_freeman_codes_original, ref_labels, model
+        print("\nEvaluating STKNet + KNN with character-level metrics...")
+        predicted_labels, similarity_matrix, char_metrics = model_predict_hanzi_edit_distance(
+            test_samples_xy, test_freeman_codes, 
+            ref_samples, ref_freeman_codes, 
+            combined_labels, model, k=5,
+            test_char_labels=test_char_labels,
+            ref_char_labels=[f"{id_.split('|')[0]}_{id_.split('|')[1]}" for id_ in [x.split('|') for x in train_ids]]
         )
         
-        if test_label_ids.size > 0 and predicted_labels_stknet.size > 0:
-            accuracy_stknet = np.mean(predicted_labels_stknet == test_label_ids)
+        if test_label_ids.size > 0 and predicted_labels.size > 0:
+            accuracy_stknet = np.mean(predicted_labels == test_label_ids)
             print(f"STKNet + KNN accuracy: {accuracy_stknet:.4f}")
         else:
             accuracy_stknet = float('nan')
@@ -832,4 +986,11 @@ if __name__ == "__main__":
         print(f"STKNet + KNN accuracy: {accuracy_stknet:.4f}")
     if 'accuracy_lstm' in locals():
         print(f"LSTM baseline accuracy: {accuracy_lstm:.4f}")
+    
+    # Print character-level metrics if available
+    if 'char_metrics' in locals() and char_metrics:
+        print("\n=== CHARACTER-LEVEL METRICS ===")
+        print(f"Test characters: {char_metrics.get('num_test_chars', 0)}")
+        print(f"Reference characters: {char_metrics.get('num_ref_chars', 0)}")
+        print(f"Character-level accuracy: {char_metrics.get('character_accuracy', 0):.4f}")
     
